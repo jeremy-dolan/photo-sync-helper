@@ -31,7 +31,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -65,6 +65,13 @@ def library_fields(p):
         "added": p.date_added.date().isoformat(),
         "original_size": p.original_filesize,
     }
+
+
+def already_done(action, photo):
+    """True if the Mac photo is already a favorite / already in the album."""
+    if action == "favorite":
+        return photo.favorite
+    return action.removeprefix("album:") in photo.albums
 
 
 def age_text(path):
@@ -315,8 +322,8 @@ def plan_from_phone(items, found, trashed):
         lib = library_fields(p) | {"match": how, "status": status}
         # Leave out what the Mac already has; --apply checks again anyway,
         # in case the library changed since it was read.
-        actions = (["favorite"] if it["favorite"] and not p.favorite else []) + \
-                  [f"album:{a}" for a in it["albums"] if a not in p.albums]
+        actions = (["favorite"] if it["favorite"] else []) + [f"album:{a}" for a in it["albums"]]
+        actions = [a for a in actions if not already_done(a, p)]
         if status == "review" and not actions:
             actions = ["verify"]  # probably imported, but only the capture time matches
         rows += [base | lib | {"action": a} for a in actions]
@@ -457,10 +464,22 @@ def match_item(item, by_stem):
 
 
 def plan_from_folders(sources, by_stem):
-    rows = []
+    """Return (rows, {action: Counter of item outcomes}).
+
+    Matched photos the Mac already has as favorites / in the album are
+    left out; an item with nothing left to do counts as "done".
+    """
+    rows, counts = [], defaultdict(Counter)
     for action, source in sources:
         for item in collect_items(source):
             photos, status, how = match_item(item, by_stem)
+            if status == "ok":
+                # Leave out what the Mac already has; --apply checks again.
+                photos = [p for p in photos if not already_done(action, p)]
+                if not photos:
+                    counts[action]["done"] += 1
+                    continue
+            counts[action][status] += 1
             first_date = min((f["date"] for f in item["files"] if f["date"]), default=None)
             base = {
                 "action": action, "status": status, "match": how, "source": source,
@@ -468,17 +487,19 @@ def plan_from_folders(sources, by_stem):
                 "capture_date": first_date.isoformat() if first_date else "",
             }
             rows += [base | library_fields(p) for p in photos] or [base]
-    return rows
+    return rows, counts
 
 
-def report_folders(rows):
-    for action in dict.fromkeys(r["action"] for r in rows):
-        rs = [r for r in rows if r["action"] == action]
-        items = defaultdict(set)
-        for r in rs:
-            items[r["status"]].add((r["source"], r["item"]))
-        print(f"{action}: {sum(r['status'] == 'ok' for r in rs)} library photos ok, "
-              f"{len(items['review'])} items to review, {len(items['unmatched'])} unmatched")
+def report_folders(rows, counts):
+    for action, c in counts.items():
+        if action == "favorite":
+            label, done, todo = "favorites exported", "already favorites on the Mac", "to mark"
+        else:
+            label = f"album {action.removeprefix('album:')!r} exported"
+            done, todo = "already in it on the Mac", "to add"
+        extra = "".join(f", {c[k]} {text}" for k, text in
+                        (("review", "to review"), ("unmatched", "unmatched")) if c[k])
+        print(f"{label}: {c.total()} ({c['done']} {done}, {c['ok']} {todo}{extra})")
     for r in rows:
         if r["status"] != "ok":
             print(f"  {r['status'].upper()}: {r['action']} {r['item']} {r['match']}")
@@ -501,8 +522,8 @@ def cmd_plan(args):
 
     if sources:
         by_stem, trashed = load_mac_library(args.mac_db)
-        rows = plan_from_folders(sources, by_stem)
-        report_folders(rows)
+        rows, counts = plan_from_folders(sources, by_stem)
+        report_folders(rows, counts)
     else:
         # Read the phone first: it's the step most likely to fail, and
         # loading the Mac library takes a while. But first make sure the
