@@ -73,11 +73,18 @@ python3 -m venv .venv
      The script can then read the library directly.
    - Or copy the library's database next to the script after each
      import: quit Photos, right-click *Photos Library* in ~/Pictures →
-     Show Package Contents → `database`, and copy `Photos.sqlite` (and
-     `Photos.sqlite-wal`, if there is one) into the script's folder,
-     replacing any old copy. The script uses this copy if it's there,
+     Show Package Contents → `database`, and copy both `Photos.sqlite`
+     and `Photos.sqlite-wal` into the script's folder, replacing any old
+     copies. The `-wal` file holds recent changes, often including the
+     import you just did; the script warns if your copy seems to be
+     missing it. (If there's no `-wal` file, `Photos.sqlite` alone is
+     enough.) The script uses this copy if it's there,
      and tells you how old it is. It only reads the copy; delete it
      when you're done.
+
+   macOS may block reading the library directly even when nothing looks
+   wrong. If it does, the script stops before copying anything from the
+   phone and explains how to make the copy.
 
 3. **Make a plan.** This step changes nothing.
    ```
@@ -87,8 +94,8 @@ python3 -m venv .venv
    ```
    phone: 249 camera-roll items (23 favorites, 12 in albums, 0 hidden)
    on the Mac: 246 matched (246 by size, 0 by date+dimensions), 0 uncertain, 3 not in the library
-   favorites to carry over: 23 (0 already favorites in this copy of the Mac library)
-   album 'Trip to Maine': 12 photos
+   favorites on the phone: 23 (2 already favorites on the Mac, 21 to mark)
+   album 'Trip to Maine' on the phone: 12 (0 already in it on the Mac, 12 to add)
 
    on the phone but not in the Mac library (not imported, or deleted from the Mac since):
      IMG_0243.PNG     2026-10-21 19:18  in the Mac's Recently Deleted
@@ -98,8 +105,9 @@ python3 -m venv .venv
    imported or deleted from the Mac afterwards. Photos still in the Mac's
    Recently Deleted are labeled as such. Import any that should be there.
 
-   Besides the changes `--apply` will make, `sync_plan.csv` lists these
-   missing photos and any uncertain (`review`) matches.
+   `sync_plan.csv` lists only what `--apply` still needs to do, leaving out
+   photos that are already favorites or already in the album on the Mac,
+   plus these missing photos and any uncertain (`review`) matches.
 
 4. **Apply.** The first time, macOS asks whether your terminal may
    control Photos; allow it.

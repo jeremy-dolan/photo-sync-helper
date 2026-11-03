@@ -80,23 +80,76 @@ def age_text(path):
 
 # ---------- Mac library ----------
 
+def system_library():
+    from osxphotos.utils import get_system_library_path
+    lib = get_system_library_path()
+    return Path(lib) if lib else Path.home() / "Pictures" / "Photos Library.photoslibrary"
+
+
+def library_help(problem):
+    lib = system_library()
+    return (f"couldn't read the Photos library ({problem}).\n"
+            "macOS's privacy protections often block this, and it may be unavoidable.\n"
+            "Instead, copy the library's database with Finder:\n"
+            "  1. Quit Photos.\n"
+            f"  2. In Finder, open {lib.parent}, right-click \"{lib.stem}\" and choose "
+            "Show Package Contents.\n"
+            "  3. Open the \"database\" folder and copy both Photos.sqlite and "
+            "Photos.sqlite-wal to\n"
+            f"     {DEFAULT_MAC_DB.parent.resolve()}\n"
+            "     replacing any old copies. The -wal file holds recent changes, such as\n"
+            "     the latest import. (If there isn't one, Photos.sqlite alone is enough.)\n"
+            "  4. Run this again; it uses the copy automatically.")
+
+
+def check_library_access():
+    """Stop now, before the phone copy, if macOS won't let us read the library."""
+    # macOS may allow reading Photos.sqlite but block its -wal and -shm
+    # files, which osxphotos also copies; try each one that exists.
+    db = system_library() / "database" / "Photos.sqlite"
+    for f in [db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")]:
+        if f == db or f.exists():
+            try:
+                with open(f, "rb") as fh:
+                    fh.read(1)
+            except OSError as e:
+                sys.exit(library_help(f"{f.name}: {e.strerror or e}"))
+
+
+def check_wal_copied(path):
+    """Warn if a database copy lacks the library's current -wal file.
+
+    The -wal holds changes not yet merged into Photos.sqlite, often
+    including the latest import. macOS allows checking its size even
+    when it blocks reading it.
+    """
+    try:
+        lib_wal = (system_library() / "database" / "Photos.sqlite-wal").stat().st_size
+    except OSError:
+        return
+    copy_wal = Path(f"{path}-wal")
+    copy_size = copy_wal.stat().st_size if copy_wal.exists() else 0
+    if lib_wal and copy_size != lib_wal:
+        print(f"WARNING: the library's Photos.sqlite-wal ({lib_wal:,} bytes) doesn't match "
+              f"this copy's ({copy_size:,} bytes),\nso recent changes may be missing from "
+              "the plan. Copy both Photos.sqlite and Photos.sqlite-wal again.")
+
+
 def load_mac_library(path):
     """Return ({stem: [PhotoInfo]}, {stem: [PhotoInfo in Recently Deleted]})."""
     import osxphotos
 
     logging.getLogger("osxphotos").setLevel(logging.ERROR)  # "could not find search db"
-    if path is None and DEFAULT_MAC_DB.exists():
-        path = DEFAULT_MAC_DB
     if path:
         print(f"Mac library: copy of the database at {path} (made {age_text(path)} ago)")
+        check_wal_copied(path)
         db = osxphotos.PhotosDB(dbfile=str(path))
     else:
         print("Mac library: reading the Photos library directly")
         try:
             db = osxphotos.PhotosDB()
         except OSError as e:
-            sys.exit(f"couldn't read the Photos library ({e}).\nEither give this terminal "
-                     "Full Disk Access, or copy Photos.sqlite here (see README).")
+            sys.exit(library_help(e))
     by_stem, trashed = defaultdict(list), defaultdict(list)
     for p in db.photos(intrash=False):
         by_stem[Path(p.original_filename).stem.upper()].append(p)
@@ -260,7 +313,10 @@ def plan_from_phone(items, found, trashed):
         p, how = found[i]
         status = "review" if how == "date only" else "ok"
         lib = library_fields(p) | {"match": how, "status": status}
-        actions = (["favorite"] if it["favorite"] else []) + [f"album:{a}" for a in it["albums"]]
+        # Leave out what the Mac already has; --apply checks again anyway,
+        # in case the library changed since it was read.
+        actions = (["favorite"] if it["favorite"] and not p.favorite else []) + \
+                  [f"album:{a}" for a in it["albums"] if a not in p.albums]
         if status == "review" and not actions:
             actions = ["verify"]  # probably imported, but only the capture time matches
         rows += [base | lib | {"action": a} for a in actions]
@@ -280,13 +336,23 @@ def report_phone(items, found, rows):
     print(f"on the Mac: {len(found) - hows['date only']} matched "
           f"({hows['size']} by size, {hows['date+dimensions']} by date+dimensions), "
           f"{hows['date only']} uncertain, {len(missing)} not in the library")
-    fav = [r for r in rows if r["action"] == "favorite" and r["status"] == "ok"]
-    print(f"favorites to carry over: {len(fav)} "
-          f"({sum(found[i][0].favorite for i, it in enumerate(items) if it['favorite'] and i in found)}"
-          " already favorites in this copy of the Mac library)")
-    for album in sorted({r["action"] for r in rows if r["action"].startswith("album:")}):
-        n = sum(r["action"] == album and r["status"] == "ok" for r in rows)
-        print(f"album {album.removeprefix('album:')!r}: {n} photo{'' if n == 1 else 's'}")
+    def summary(label, on_phone, done, action, done_text, todo_text):
+        """e.g. "favorites on the phone: 47 (45 already favorites on the Mac, 2 to mark)"."""
+        todo = sum(r["action"] == action and r["status"] == "ok" for r in rows)
+        rest = len(on_phone) - done - todo
+        print(f"{label}: {len(on_phone)} ({done} {done_text}, {todo} {todo_text}"
+              + (f", {rest} missing or uncertain" if rest else "") + ")")
+
+    favs = [i for i, it in enumerate(items) if it["favorite"]]
+    done = sum(i in found and found[i][1] != "date only" and found[i][0].favorite for i in favs)
+    summary("favorites on the phone", favs, done, "favorite",
+            "already favorites on the Mac", "to mark")
+    for album in sorted({a for it in items for a in it["albums"]}):
+        members = [i for i, it in enumerate(items) if album in it["albums"]]
+        done = sum(i in found and found[i][1] != "date only" and album in found[i][0].albums
+                   for i in members)
+        summary(f"album {album!r} on the phone", members, done, f"album:{album}",
+                "already in it on the Mac", "to add")
     if missing:
         print("\non the phone but not in the Mac library "
               "(not imported, or deleted from the Mac since):")
@@ -421,6 +487,8 @@ def report_folders(rows):
 # ---------- plan ----------
 
 def cmd_plan(args):
+    if args.mac_db is None and DEFAULT_MAC_DB.exists():
+        args.mac_db = DEFAULT_MAC_DB
     sources = [("favorite", d) for d in args.favorites]
     for spec in args.album:
         name, sep, d = spec.partition("=")
@@ -437,7 +505,10 @@ def cmd_plan(args):
         report_folders(rows)
     else:
         # Read the phone first: it's the step most likely to fail, and
-        # loading the Mac library takes a while.
+        # loading the Mac library takes a while. But first make sure the
+        # library is readable, so a blocked library doesn't waste the copy.
+        if not args.mac_db:
+            check_library_access()
         with tempfile.TemporaryDirectory() as tmp:
             phone_dir = Path(args.phone_db) if args.phone_db else Path(tmp)
             if not args.phone_db:
@@ -456,7 +527,11 @@ def cmd_plan(args):
         w.writerows(rows)
     print(f"\nwrote {args.plan}")
     print("(Nothing has been changed.)")
-    print(f"Review {Path(args.plan).name}, then run with --apply")
+    if any(r["status"] == "ok" and (r["action"] == "favorite" or r["action"].startswith("album:"))
+           for r in rows):
+        print(f"Review {Path(args.plan).name}, then run with --apply")
+    else:
+        print("Nothing for --apply to do.")
     if any(r["status"] == "review" for r in rows):
         print("review rows are skipped by --apply; change their status to 'ok' in the "
               "CSV to include them")
