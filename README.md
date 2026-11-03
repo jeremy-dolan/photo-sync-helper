@@ -56,7 +56,7 @@ can't read it.
 ## Setup
 
 ```
-git clone <this repo> && cd <this repo>
+git clone https://github.com/jeremy-dolan/photo-sync-helper.git && cd photo-sync-helper
 python3 -m venv .venv
 .venv/bin/pip install osxphotos pymobiledevice3
 ```
